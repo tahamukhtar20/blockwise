@@ -367,6 +367,23 @@ function finish(o: Outcome, output: OutLine[], files: Files, ms: number, start: 
   session = null;
 }
 
+/** A worker loaded ahead of time, so pressing Run doesn't wait for the download. */
+type Warm = { w: Worker; ready: boolean; onReady: (() => void) | null };
+let warm: Warm | null = null;
+function spawn(): Warm {
+  const entry: Warm = { w: new Worker(new URL("./lang/worker.ts", import.meta.url), { type: "module" }), ready: false, onReady: null };
+  entry.w.addEventListener("message", (e) => {
+    if (e.data && e.data.ready) {
+      entry.ready = true;
+      entry.onReady?.();
+    }
+  });
+  return entry;
+}
+export function prewarm() {
+  if (!warm && typeof Worker !== "undefined") warm = spawn();
+}
+
 export function run() {
   if (state.phase === "running") return;
   if (state.phase === "stepping" && session) return runToEnd();
@@ -374,33 +391,41 @@ export function run() {
   const exec = getCompiled().exec!;
   const start = state.files;
   worker?.terminate();
-  const w = new Worker(new URL("./lang/worker.ts", import.meta.url), { type: "module" });
+  const entry = warm ?? spawn();
+  warm = null;
+  const w = entry.w;
   worker = w;
   const t0 = performance.now();
   set({ phase: "running", status: { kind: "running" }, output: [], outTab: "output", view: state.view === "code" ? "code" : "output", showProblems: false });
-  w.onmessage = (e: MessageEvent<{ outcome: Outcome; output: string[]; files: Files; ms: number }>) => {
-    if (worker !== w) return;
+  const done = () => {
     clearTimeout(backstop);
     w.terminate();
     worker = null;
+    prewarm();
+  };
+  w.onmessage = (e: MessageEvent<{ outcome?: Outcome; output: string[]; files: Files; ms: number }>) => {
+    if (worker !== w || !e.data.outcome) return;
+    done();
     finish(e.data.outcome, e.data.output.map((text) => ({ text, kind: "out" })), e.data.files, Math.max(1, Math.round(e.data.ms)), start);
   };
   w.onerror = (e) => {
     if (worker !== w) return;
-    clearTimeout(backstop);
-    w.terminate();
-    worker = null;
+    done();
     finish({ status: "error", row: -1, msg: e.message || "The program could not start" }, [], start, performance.now() - t0, start);
   };
   w.postMessage({ exec, files: state.files, limitMs: LIMIT_MS });
   // If the worker can't even report back (a single huge operation), stop it from here.
-  clearTimeout(backstop);
-  backstop = window.setTimeout(() => {
-    if (worker !== w) return;
-    w.terminate();
-    worker = null;
-    set({ phase: "idle", status: { kind: "stopped" }, output: [...state.output, { text: "Stopped: the program did not respond.", kind: "err" }] });
-  }, LIMIT_MS + 2000);
+  // The clock starts once the worker has loaded, so a slow connection doesn't count against the program.
+  const arm = () => {
+    clearTimeout(backstop);
+    backstop = window.setTimeout(() => {
+      if (worker !== w) return;
+      done();
+      set({ phase: "idle", status: { kind: "stopped" }, output: [...state.output, { text: "Stopped: the program did not respond.", kind: "err" }] });
+    }, LIMIT_MS + 2000);
+  };
+  if (entry.ready) arm();
+  else entry.onReady = arm;
 }
 
 export function stop() {
@@ -408,6 +433,7 @@ export function stop() {
     worker.terminate();
     worker = null;
     clearTimeout(backstop);
+    prewarm();
     set({ phase: "idle", status: { kind: "stopped" }, output: [...state.output, { text: "Stopped.", kind: "info" }] });
   }
 }

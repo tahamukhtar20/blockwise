@@ -1,6 +1,8 @@
 // Runs a compiled program away from the page, so a slow program never freezes the editor.
 import { drive, load, makeRuntime, type Files } from "./runtime.ts";
 
+postMessage({ ready: true });
+
 self.onmessage = (e: MessageEvent<{ exec: string; files: Files; limitMs: number }>) => {
   const { exec, files, limitMs } = e.data;
   const output: string[] = [];
